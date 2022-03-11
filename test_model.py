@@ -5,7 +5,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.models.resnet import resnet34, resnet50
+from torchvision.models.resnet import resnet34, resnet50, resnet101
 
 
 class ResContextBlock(nn.Module):
@@ -114,7 +114,6 @@ class UpBlock(nn.Module):
         self.out_filters = out_filters
 
         self.dropout1 = nn.Dropout2d(p=dropout_rate)
-
         self.dropout2 = nn.Dropout2d(p=dropout_rate)
 
         self.conv1 = nn.Conv2d(in_filters // 4 + 2 * out_filters, out_filters, (3, 3), padding=1)
@@ -218,25 +217,23 @@ class ResidualBasedFusionBlock(nn.Module):
 
 
 # ----------------------------------------------------------------------------- #
-# Encoder： ResNet
+# Image Encoder： ResNet
 # ----------------------------------------------------------------------------- #
 
 class ResNet(nn.Module):
-    def __init__(self, in_channels=3, dropout_rate=0.2,
-                 pretrained=True):
+    def __init__(self, in_channels=3, dropout_rate=0.2,pretrained=True):
         super(ResNet, self).__init__()
-
-
         # net = resnet34(pretrained)
         # self.expansion = 1
-
-        net = resnet50(pretrained)
+        # net = resnet50(pretrained)
+        # self.expansion = 4
+        net = resnet101(pretrained)
         self.expansion = 4
 
-        self.feature_channels = [64 * self.expansion, 128 * self.expansion, 256 * self.expansion, 512 * self.expansion]
-
-        # Note that we do not downsample for conv1
-        # self.conv1 = net.conv1
+        self.feature_channels = [64 * self.expansion,
+                                 128 * self.expansion,
+                                 256 * self.expansion,
+                                 512 * self.expansion]
         self.conv1 = nn.Conv2d(
             in_channels, 64, kernel_size=7, stride=1, padding=3, bias=False)
         if in_channels == 3:
@@ -292,11 +289,8 @@ class ASPP(nn.Module):  # 更换为 CA 或者 CBAM
             image_features, size=size, mode='bilinear')
 
         atrous_block1 = self.atrous_block1(x)
-
         atrous_block6 = self.atrous_block6(x)
-
         atrous_block12 = self.atrous_block12(x)
-
         atrous_block18 = self.atrous_block18(x)
 
         net = self.conv_1x1_output(torch.cat([
@@ -304,61 +298,48 @@ class ASPP(nn.Module):  # 更换为 CA 或者 CBAM
             atrous_block12, atrous_block18], dim=1))
         return net
 
-
-class LiDARAtt(ResNet): ## 改为轻型fusion 参考方法包含： siamese, 4D-net
-    def __init__(self, in_channels=5):
-        super(LiDARAtt, self).__init__(in_channels=in_channels)
-
-    def forward(self, x):
-        conv1_out = self.relu(self.bn1(self.conv1(x)))
-        layer1_out = self.layer1(self.maxpool(conv1_out))
-        layer2_out = self.layer2(layer1_out)  # downsample
-        layer3_out = self.dropout(self.layer3(layer2_out))  # downsample
-        layer4_out = self.dropout(self.layer4(layer3_out))  # downsample
-
-        return [layer1_out, layer2_out, layer3_out, layer4_out]
-
 class SalsaNextFusion(SalsaNext):
     def __init__(self, in_channels= 8, nclasses=20, base_channels=32, img_feature_channels=[]):
         super(SalsaNextFusion, self).__init__(in_channels=in_channels, base_channels=base_channels,
                                               nclasses=nclasses, softmax=True)
-
+        # image fusion
         self.fusionblock_i1 = ResidualBasedFusionBlock(self.base_channels * 2, img_feature_channels[0])
         self.fusionblock_i2 = ResidualBasedFusionBlock(self.base_channels * 4, img_feature_channels[1])
         self.fusionblock_i3 = ResidualBasedFusionBlock(self.base_channels * 8, img_feature_channels[2])
         self.fusionblock_i4 = ResidualBasedFusionBlock(self.base_channels * 8, img_feature_channels[3])
 
-        # self.fusionblock_l1 = ResidualBasedFusionBlock(self.base_channels * 2, img_feature_channels[0])
-        # self.fusionblock_l2 = ResidualBasedFusionBlock(self.base_channels * 4, img_feature_channels[1])
-        # self.fusionblock_l3 = ResidualBasedFusionBlock(self.base_channels * 8, img_feature_channels[2])
-        # self.fusionblock_l4 = ResidualBasedFusionBlock(self.base_channels * 8, img_feature_channels[3])
+        # lidar fusion
+        self.fusionblock_l1 = ResidualBasedFusionBlock(self.base_channels * 2, img_feature_channels[0])
+        self.fusionblock_l2 = ResidualBasedFusionBlock(self.base_channels * 4, img_feature_channels[1])
+        self.fusionblock_l3 = ResidualBasedFusionBlock(self.base_channels * 8, img_feature_channels[2])
+        self.fusionblock_l4 = ResidualBasedFusionBlock(self.base_channels * 8, img_feature_channels[3])
 
         self.aspp = ASPP(self.base_channels * 8, self.base_channels * 8)
 
-    def forward(self, x, img_feature=[], pcd_att=[]):
+    def forward(self, x, img_feature=[],pcd_att=[]):
         downCntx = self.downCntx(x)
         downCntx = self.downCntx2(downCntx)
         downCntx = self.downCntx3(downCntx)
 
         down0c, down0b = self.resBlock1(downCntx)
         down0c1 = self.fusionblock_i1(down0c, img_feature[0])
-        # down0c2 = self.fusionblock_l1(down0c1, pcd_att[0])
-        down0c2 = down0c1
+        down0c2 = self.fusionblock_l1(down0c1, pcd_att[0])
+        # down0c2 = down0c1
 
         down1c, down1b = self.resBlock2(down0c2)
         down1c1 = self.fusionblock_i2(down1c, img_feature[1])
-        # down1c2 = self.fusionblock_i2(down1c1, pcd_att[1])
-        down1c2 = down1c1
+        down1c2 = self.fusionblock_i2(down1c1, pcd_att[1])
+        # down1c2 = down1c1
 
         down2c, down2b = self.resBlock3(down1c2)
         down2c1 = self.fusionblock_i3(down2c, img_feature[2])
-        # down2c2 = self.fusionblock_i3(down2c1, pcd_att[2])
-        down2c2 = down2c1
+        down2c2 = self.fusionblock_i3(down2c1, pcd_att[2])
+        # down2c2 = down2c1
 
         down3c, down3b = self.resBlock4(down2c2)
         down3c1 = self.fusionblock_i4(down3c, img_feature[3])
-        # down3c2 = self.fusionblock_i4(down3c1, pcd_att[3])
-        down3c2 = down3c1
+        down3c2 = self.fusionblock_i4(down3c1, pcd_att[3])
+        # down3c2 = down3c1
 
         down5c = self.aspp(self.resBlock5(down3c2))
         # down5c = self.aspp(down3c2)
@@ -374,68 +355,20 @@ class SalsaNextFusion(SalsaNext):
         return logits
 
 
-class RGBDecoder(nn.Module):
-    def __init__(self, in_channels=[], nclasses=4, base_channels=64):
-        super(RGBDecoder, self).__init__()
-
-        self.up_4a = nn.Sequential(
-            nn.Conv2d(in_channels[3], base_channels, 3, padding=1),
-            nn.LeakyReLU(),
-            nn.BatchNorm2d(base_channels),
-            nn.Upsample(scale_factor=2, mode="bilinear")
-        )
-        self.up_3a = nn.Sequential(
-            nn.Conv2d(in_channels[2] + base_channels, base_channels, 3, padding=1),
-            nn.LeakyReLU(),
-            nn.BatchNorm2d(base_channels),
-            nn.Upsample(scale_factor=2, mode="bilinear")
-
-        )
-        self.up_2a = nn.Sequential(
-            nn.Conv2d(in_channels[1] + base_channels, base_channels, 3, padding=1),
-            nn.LeakyReLU(),
-            nn.BatchNorm2d(base_channels),
-            nn.Upsample(scale_factor=2, mode="bilinear")
-        )
-        self.up_1a = nn.Sequential(
-            nn.Conv2d(in_channels[0] + base_channels, base_channels, 1),
-            nn.LeakyReLU(),
-            nn.BatchNorm2d(base_channels),
-            nn.Upsample(scale_factor=2, mode="bilinear")
-        )
-        self.conv = nn.Conv2d(base_channels, nclasses, kernel_size=3, padding=1)
-
-    def forward(self, inputs):
-        up_4a = self.up_4a(inputs[3])
-        up_3a = self.up_3a(torch.cat((up_4a, inputs[2]), dim=1))
-        up_2a = self.up_2a(torch.cat((up_3a, inputs[1]), dim=1))
-        up_1a = self.up_1a(torch.cat((up_2a, inputs[0]), dim=1))
-        out = self.conv(up_1a)
-        out = F.softmax(out, dim=1)
-        return out
-
-
 class PMFNet(nn.Module):
     def __init__(self, pcd_channels=5, img_channels=3, nclasses=20, base_channels=32,
-                 imagenet_pretrained=True, image_backbone="resnet50"):
+                 imagenet_pretrained=True):
         super(PMFNet, self).__init__()
 
-        # self.camera_stream_encoder = ResNet(
-        #     in_channels=img_channels,
-        #     pretrained=imagenet_pretrained,
-        #     backbone=image_backbone)
+        self.camera_stream_encoder = ResNet(in_channels=img_channels,
+                                            pretrained=imagenet_pretrained)
 
-        self.camera_stream_encoder = ResNet(in_channels=img_channels)
-        # self.lidar_stream_att = LiDARAtt(in_channels=pcd_channels)
-
-        # self.camera_stream_decoder_t1 = RGBDecoder(
-        #     self.camera_stream_encoder.feature_channels,
-        #     nclasses=nclasses, base_channels=self.camera_stream_encoder.expansion*16)
+        self.lidar_stream_att = ResNet(in_channels=pcd_channels,
+                                       pretrained=imagenet_pretrained)
 
         self.lidar_stream = SalsaNextFusion(in_channels=pcd_channels, nclasses=nclasses,
                                             base_channels=base_channels,
                                             img_feature_channels=self.camera_stream_encoder.feature_channels)
-
 
         # self.camera_stream_decoder_t = RGBDecoder(
         #     self.camera_stream_encoder.feature_channels,
@@ -444,15 +377,15 @@ class PMFNet(nn.Module):
         # self.lidar_stream_att = LiDARAtt(in_channels=pcd_channels,
         #                                  nclasses=nclasses, base_channels=base_channels)
 
-    def forward(self, data):
-        img, pcd= data[:,0:3,:,:],data[:,3:7,:,:]
+    def forward(self, img, pcd):
+        # img, pcd= data[:,:3,:,:],data[:,3:7,:,:]
         img_feature = self.camera_stream_encoder(img)
-        # pcd_att = self.lidar_stream_att(pcd[:,1,:,:,:])
-        # pcd_feature = self.lidar_stream(pcd[:,0,:,:], img_feature)
+        pcd_att = self.lidar_stream_att(pcd)
+        pcd_feature = self.lidar_stream(pcd, img_feature, pcd_att)
         # print(pcd_feature.shape)
 
         # camera_pred = self.camera_stream_decoder(img_feature)
-        return img_feature #, pcd_feature  # ,camera_pred
+        return pcd_feature  # ,camera_pred
 
 
 # if __name__ == '__main__':
